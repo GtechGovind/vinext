@@ -14,7 +14,8 @@
 import { parseAst, type Plugin } from "vite";
 import MagicString from "magic-string";
 import path, { toSlash } from "pathslash";
-import { pathToFileURL } from "node:url";
+import fs from "node:fs";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { tryRealpathSync } from "../build/ssr-manifest.js";
 import { VIRTUAL_MODULE_ID_RE, VIRTUAL_PREFIX } from "../utils/virtual-module.js";
 import {
@@ -162,6 +163,130 @@ export function rewriteServerCjsGlobals(
   return rewriteCanonicalSourceIdentity(code, canonicalId, rootPaths, "server");
 }
 
+/** Preserve source identity in dependencies explicitly handled by Vite's optimizer. */
+export function createOptimizeDepsCjsGlobalsPlugin(): Plugin {
+  return createDependencyCjsGlobalsPlugin("vinext:optimize-deps-cjs-globals");
+}
+
+/**
+ * Preserve CommonJS source-identity globals when the Vite dev module runner
+ * bundles a server dependency. The CommonJS conversion runs earlier in the
+ * plugin pipeline; this transform restores the Node source identity it needs.
+ */
+export function createServeDependencyCjsGlobalsPlugin(options: { enabled: () => boolean }): Plugin {
+  return createDependencyCjsGlobalsPlugin("vinext:serve-dependency-cjs-globals", {
+    shouldTransform(consumer) {
+      return options.enabled() && consumer !== "client";
+    },
+  });
+}
+
+/**
+ * Define unresolved CommonJS globals against the emitted Node server chunk.
+ * Node rejects an otherwise valid ESM bundle when a free `__dirname` or
+ * `__filename` appears alongside top-level await. `import.meta.dirname` and
+ * `import.meta.filename` keep the values relative to a relocated deployment.
+ */
+export function createBuildChunkCjsGlobalsPlugin(options: { enabled: () => boolean }): Plugin {
+  return {
+    name: "vinext:build-chunk-cjs-globals",
+    apply: "build",
+    renderChunk: {
+      order: "post",
+      handler(code, _chunk, outputOptions) {
+        if (
+          !options.enabled() ||
+          this.environment?.config.consumer !== "server" ||
+          outputOptions.format !== "es"
+        ) {
+          return null;
+        }
+        return rewriteBuildChunkCjsGlobals(code);
+      },
+    },
+  };
+}
+
+function createDependencyCjsGlobalsPlugin(
+  name: string,
+  options: {
+    shouldTransform?: (consumer: string | undefined) => boolean;
+  } = {},
+): Plugin {
+  return {
+    name,
+    transform: {
+      filter: {
+        id: /(?:^|[/\\])node_modules[/\\].*\.(?:[cm]?[jt]s|[jt]sx)(?:\?.*)?$/,
+        code: /__filename|__dirname/,
+      },
+      handler(code, id) {
+        if (
+          options.shouldTransform &&
+          !options.shouldTransform(this.environment?.config.consumer)
+        ) {
+          return null;
+        }
+        return rewriteBundledDependencyCjsGlobals(code, id);
+      },
+    },
+  };
+}
+
+// Test-only entry point. The optimizer plugin delegates to this function so
+// parser and package-format checks are directly testable without a build.
+export function rewriteBundledDependencyCjsGlobals(code: string, id: string): RewriteResult | null {
+  if (!mayContainServerCjsGlobal(code)) return null;
+
+  const canonicalId = canonicalDependencyModuleId(id);
+  if (!canonicalId || !isCommonJsDependency(canonicalId)) return null;
+
+  let ast: unknown;
+  try {
+    ast = parseAst(code);
+  } catch {
+    return null;
+  }
+
+  const injected = injectServerCjsGlobals(ast, canonicalId);
+  if (!injected) return null;
+
+  const output = new MagicString(code);
+  output.appendLeft(findDirectivePrologueEnd(ast), `\n${injected}`);
+  return {
+    code: output.toString(),
+    map: output.generateMap({ hires: "boundary" }),
+  };
+}
+
+// Test-only entry point. The build plugin delegates to this function so the
+// final-chunk free-global analysis is covered without a parallel implementation.
+export function rewriteBuildChunkCjsGlobals(code: string): RewriteResult | null {
+  if (!mayContainServerCjsGlobal(code)) return null;
+
+  let ast: unknown;
+  try {
+    ast = parseAst(code);
+  } catch {
+    return null;
+  }
+
+  const analysis = analyzeServerCjsGlobals(ast);
+  const injected = CJS_GLOBALS.filter(
+    (name) => analysis.reads.has(name) && !analysis.moduleBindings.has(name),
+  )
+    .map((name) => `var ${name} = import.meta.${name.slice(2)};`)
+    .join("");
+  if (!injected) return null;
+
+  const output = new MagicString(code);
+  output.appendLeft(findDirectivePrologueEnd(ast), `\n${injected}`);
+  return {
+    code: output.toString(),
+    map: output.generateMap({ hires: "boundary" }),
+  };
+}
+
 function rewriteCanonicalSourceIdentity(
   code: string,
   canonicalId: string,
@@ -209,6 +334,60 @@ function rewriteCanonicalSourceIdentity(
 
 function cleanModuleId(id: string): string {
   return id.split("?", 1)[0];
+}
+
+function canonicalDependencyModuleId(id: string): string | null {
+  const cleanId = cleanModuleId(id);
+  if (!cleanId || cleanId.startsWith(VIRTUAL_PREFIX)) return null;
+
+  let filePath: string;
+  try {
+    filePath = cleanId.startsWith("file:") ? toSlash(fileURLToPath(cleanId)) : toSlash(cleanId);
+  } catch {
+    return null;
+  }
+
+  if (!path.isAbsolute(filePath) || !filePath.includes("/node_modules/")) return null;
+  if (!TRANSFORMABLE_SCRIPT_EXTENSIONS.has(path.extname(filePath))) return null;
+  return canonicalizePath(filePath);
+}
+
+export function isBundledCommonJsDependencyId(id: string): boolean {
+  const canonicalId = canonicalDependencyModuleId(id);
+  return canonicalId !== null && isCommonJsDependency(canonicalId);
+}
+
+function isCommonJsDependency(canonicalId: string): boolean {
+  const extension = path.extname(canonicalId);
+  if (extension === ".cjs" || extension === ".cts") return true;
+  if (extension === ".mjs" || extension === ".mts") return false;
+
+  // For ambiguous .js/.jsx/.ts/.tsx files, Node's nearest package scope is
+  // the authoritative module-format metadata. Default to CommonJS exactly as
+  // Node does when the package omits `type` or has no package.json.
+  let directory = path.dirname(canonicalId);
+  for (;;) {
+    const packageJsonPath = path.join(directory, "package.json");
+    if (fs.existsSync(packageJsonPath)) {
+      try {
+        const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8")) as {
+          type?: unknown;
+        };
+        return packageJson.type !== "module";
+      } catch {
+        return true;
+      }
+    }
+
+    // Node package scopes never cross a node_modules boundary. An unpackaged
+    // dependency therefore keeps Node's default CommonJS format even when the
+    // application above node_modules is declared as type: module.
+    if (path.basename(directory) === "node_modules") return true;
+
+    const parent = path.dirname(directory);
+    if (parent === directory) return true;
+    directory = parent;
+  }
 }
 
 function createRootPaths(root: string, options: { outputDirs?: string[] } = {}): RootPaths {

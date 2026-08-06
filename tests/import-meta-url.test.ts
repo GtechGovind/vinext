@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import {
   createImportMetaUrlPlugin,
+  rewriteBuildChunkCjsGlobals,
+  rewriteBundledDependencyCjsGlobals,
   rewriteImportMetaUrl,
   rewriteServerCjsGlobals,
 } from "../packages/vinext/src/plugins/import-meta-url.js";
@@ -19,6 +21,9 @@ describe("vinext:import-meta-url plugin", () => {
   let linkedRoot: string;
   let pagePath: string;
   let canonicalPagePath: string;
+  let cjsDependencyPath: string;
+  let esmDependencyPath: string;
+  let unpackagedDependencyPath: string;
 
   beforeAll(async () => {
     tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-import-meta-url-"));
@@ -28,6 +33,30 @@ describe("vinext:import-meta-url plugin", () => {
 
     await fsp.mkdir(path.dirname(pagePath), { recursive: true });
     await fsp.writeFile(pagePath, `export const url = import.meta.url;\n`);
+    const cjsDependencyDir = path.join(realRoot, "node_modules", "cjs-source-identity");
+    const esmDependencyDir = path.join(realRoot, "node_modules", "esm-source-identity");
+    cjsDependencyPath = path.join(cjsDependencyDir, "index.js");
+    esmDependencyPath = path.join(esmDependencyDir, "index.js");
+    const typeModuleAppDir = path.join(tmpDir, "type-module-app");
+    unpackagedDependencyPath = path.join(
+      typeModuleAppDir,
+      "node_modules",
+      "unpackaged-dependency",
+      "index.js",
+    );
+    await Promise.all([
+      fsp.mkdir(cjsDependencyDir, { recursive: true }),
+      fsp.mkdir(esmDependencyDir, { recursive: true }),
+      fsp.mkdir(path.dirname(unpackagedDependencyPath), { recursive: true }),
+    ]);
+    await Promise.all([
+      fsp.writeFile(path.join(cjsDependencyDir, "package.json"), '{"type":"commonjs"}\n'),
+      fsp.writeFile(path.join(esmDependencyDir, "package.json"), '{"type":"module"}\n'),
+      fsp.writeFile(cjsDependencyPath, "exports.paths = [__filename, __dirname];\n"),
+      fsp.writeFile(esmDependencyPath, "export const path = __dirname;\n"),
+      fsp.writeFile(path.join(typeModuleAppDir, "package.json"), '{"type":"module"}\n'),
+      fsp.writeFile(unpackagedDependencyPath, "exports.path = __dirname;\n"),
+    ]);
     // The plugin emits canonical forward-slash paths, so expectations are
     // built from the slash form (path.dirname preserves separators on win32).
     canonicalPagePath = toSlash(await fsp.realpath(pagePath));
@@ -114,6 +143,68 @@ describe("vinext:import-meta-url plugin", () => {
     );
     expect(result?.code).not.toContain("linked-app");
     expect(result?.code).toContain(`console.log(__filename, __dirname);`);
+  });
+
+  it("injects source paths for a CommonJS dependency optimizer input", async () => {
+    const canonicalDependencyPath = toSlash(await fsp.realpath(cjsDependencyPath));
+    const result = rewriteBundledDependencyCjsGlobals(
+      `"use strict";\nexports.paths = [__filename, __dirname];\n`,
+      `${cjsDependencyPath}?v=test`,
+    );
+
+    expect(result?.code).toContain(`"use strict";\nvar __filename`);
+    expect(result?.code).toContain(`var __filename = ${JSON.stringify(canonicalDependencyPath)};`);
+    expect(result?.code).toContain(
+      `var __dirname = ${JSON.stringify(toSlash(path.dirname(canonicalDependencyPath)))};`,
+    );
+  });
+
+  it("defaults an unpackaged node_modules dependency to CommonJS", async () => {
+    const canonicalDependencyPath = toSlash(await fsp.realpath(unpackagedDependencyPath));
+    const result = rewriteBundledDependencyCjsGlobals(
+      `exports.path = __dirname;\n`,
+      unpackagedDependencyPath,
+    );
+
+    expect(result?.code).toContain(
+      `var __dirname = ${JSON.stringify(toSlash(path.dirname(canonicalDependencyPath)))};`,
+    );
+  });
+
+  it("does not inject CommonJS globals into a dependency declared as ESM", () => {
+    const result = rewriteBundledDependencyCjsGlobals(
+      `export const paths = [__filename, __dirname];\n`,
+      esmDependencyPath,
+    );
+
+    expect(result).toBeNull();
+  });
+
+  it("does not inject dependency globals mentioned only in comments and strings", () => {
+    const result = rewriteBundledDependencyCjsGlobals(
+      `// __filename\nexports.note = "__dirname";\n`,
+      cjsDependencyPath,
+    );
+
+    expect(result).toBeNull();
+  });
+
+  it("defines free CommonJS globals relative to an emitted ESM chunk", () => {
+    const result = rewriteBuildChunkCjsGlobals(
+      `"use strict";\nconst value = await Promise.resolve(__dirname + __filename);\n`,
+    );
+
+    expect(result?.code).toContain(
+      `"use strict";\nvar __filename = import.meta.filename;var __dirname = import.meta.dirname;`,
+    );
+  });
+
+  it("does not redefine CommonJS globals already bound by an emitted chunk", () => {
+    const result = rewriteBuildChunkCjsGlobals(
+      `const __dirname = import.meta.dirname;\nawait Promise.resolve(__dirname);\n`,
+    );
+
+    expect(result).toBeNull();
   });
 
   it("does not inject when __filename or __dirname are declared at top level", () => {

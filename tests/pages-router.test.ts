@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from "vite-plus/test";
-import { createServer, build, type ViteDevServer } from "vite-plus";
+import { createBuilder, createServer, build, type ViteDevServer } from "vite-plus";
 import { request as httpRequest, type IncomingHttpHeaders } from "node:http";
 import path from "node:path";
 import fs from "node:fs";
@@ -8,6 +8,7 @@ import os from "node:os";
 import { Readable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import zlib from "node:zlib";
+import { toSlash } from "pathslash";
 import vinext from "../packages/vinext/src/index.js";
 import { createModuleDependencyCache } from "../packages/vinext/src/build/module-dependency-cache.js";
 import {
@@ -725,6 +726,25 @@ describe("Pages Router integration", () => {
     expect(glob).toContain("instrumentation-client.ts");
   });
 
+  it("handles bundled Pages SSR CommonJS without enabling dependency discovery", () => {
+    const optimizeDeps = server.config.environments.ssr?.optimizeDeps;
+
+    expect(optimizeDeps?.noDiscovery).not.toBe(false);
+    expect(optimizeDeps?.exclude).toEqual(
+      expect.arrayContaining(["react", "react-dom", "react-dom/server", "ipaddr.js", "vinext"]),
+    );
+    expect(optimizeDeps?.rolldownOptions?.plugins).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "vinext:optimize-deps-cjs-globals" }),
+      ]),
+    );
+    expect(server.config.plugins).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "vinext:serve-dependency-cjs-globals" }),
+      ]),
+    );
+  });
+
   it("resolves tsconfig path aliases (@/ imports)", async () => {
     const res = await fetch(`${baseUrl}/alias-test`);
     expect(res.status).toBe(200);
@@ -742,6 +762,22 @@ describe("Pages Router integration", () => {
     const html = await res.text();
     expect(html).toContain("About");
     expect(html).toContain("This is the about page.");
+  });
+
+  // Next.js supports bundling Pages Router dependencies and preserves CommonJS
+  // module globals for bundled packages. The fixture imports an actual CJS file
+  // from node_modules whose export is computed from __dirname at module load.
+  // Ported from the behavior covered by Next.js:
+  // test/integration/externals-pages-bundle/test/index.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/integration/externals-pages-bundle/test/index.test.ts
+  it("loads a bundled CommonJS dependency that reads its module directory", async () => {
+    const res = await fetch(`${baseUrl}/cjs-dependency-globals`);
+    expect(res.status).toBe(200);
+
+    const html = await res.text();
+    expect(html).toMatch(
+      /<p id="runtime-path">.*next\/dist\/compiled\/regenerator-runtime\/runtime\.js<\/p>/,
+    );
   });
 
   // Refs #1463: Pages Router should reject non-GET/HEAD methods to static
@@ -6572,6 +6608,110 @@ export default function CounterPage() {
     expect(result.continue).toBe(false);
     expect(result.response).toBeInstanceOf(Response);
     expect(result.response.status).toBe(500);
+  });
+});
+
+describe("Pages bundled CommonJS dependency in a relocated production build", () => {
+  let tmpDir: string;
+  let deployOutDir: string;
+  let canonicalDeployOutDir: string;
+  let prodServer: import("node:http").Server | undefined;
+  let prodUrl: string;
+
+  beforeAll(async () => {
+    tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-pages-cjs-dependency-prod-"));
+    const sourceRoot = path.join(tmpDir, "source");
+    const buildOutDir = path.join(sourceRoot, "dist");
+    deployOutDir = path.join(tmpDir, "deployed-output");
+    await fsp.mkdir(path.join(sourceRoot, "pages"), { recursive: true });
+    await fsp.symlink(
+      path.resolve(import.meta.dirname, "../node_modules"),
+      path.join(sourceRoot, "node_modules"),
+      "junction",
+    );
+    await fsp.writeFile(path.join(sourceRoot, "package.json"), JSON.stringify({ type: "module" }));
+    await fsp.writeFile(
+      path.join(sourceRoot, "pages", "_app.tsx"),
+      `export default function App({ Component, pageProps }) {
+  return <Component {...pageProps} />;
+}
+`,
+    );
+    await fsp.writeFile(
+      path.join(sourceRoot, "pages", "async-module.tsx"),
+      `const value = await Promise.resolve(42);
+export default function AsyncPage() {
+  return <p>{value}</p>;
+}
+`,
+    );
+    await fsp.writeFile(
+      path.join(sourceRoot, "pages", "cjs-dependency-globals.jsx"),
+      `import regeneratorRuntimePath from "next/dist/compiled/regenerator-runtime/path";
+export function getServerSideProps() {
+  return { props: { runtimePath: regeneratorRuntimePath.path } };
+}
+export default function Page({ runtimePath }) {
+  return <p id="runtime-path">{runtimePath}</p>;
+}
+`,
+    );
+
+    const builder = await createBuilder({
+      root: sourceRoot,
+      configFile: false,
+      plugins: [
+        vinext({ disableAppRouter: true }),
+        {
+          name: "test:pages-server-top-level-await",
+          apply: "build",
+          renderChunk(code) {
+            if (this.environment?.config.consumer !== "server") return null;
+            return `${code}\nawait Promise.resolve();\n`;
+          },
+        },
+      ],
+      logLevel: "silent",
+    });
+    await builder.buildApp();
+    await fsp.cp(buildOutDir, deployOutDir, { recursive: true });
+    canonicalDeployOutDir = toSlash(await fsp.realpath(deployOutDir));
+
+    const serverEntry = await fsp.readFile(path.join(deployOutDir, "server", "entry.js"), "utf8");
+    expect(serverEntry).toContain("await ");
+    expect(serverEntry).toContain("import.meta.dirname");
+
+    const { startProdServer } = await import("../packages/vinext/src/server/prod-server.js");
+    prodServer = unwrapStartedProdServer(
+      await startProdServer({
+        port: 0,
+        host: "127.0.0.1",
+        outDir: deployOutDir,
+      }),
+    );
+    const addr = prodServer.address() as { port: number };
+    prodUrl = `http://127.0.0.1:${addr.port}`;
+  }, 120000);
+
+  afterAll(async () => {
+    if (prodServer) {
+      await new Promise<void>((resolve) => prodServer!.close(() => resolve()));
+    }
+    if (tmpDir) {
+      await fsp.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  // Next's webpack Pages bundle leaves __dirname relative to the emitted page
+  // chunk, so relocating the output also relocates the computed path. Do not
+  // bake the build machine's node_modules path into a deployable bundle.
+  it("keeps CommonJS globals relative to the deployed server chunk", async () => {
+    const res = await fetch(`${prodUrl}/cjs-dependency-globals`);
+    expect(res.status).toBe(200);
+
+    const html = await res.text();
+    expect(html).toContain(`<p id="runtime-path">${canonicalDeployOutDir}/server/runtime.js</p>`);
+    expect(html).not.toContain("/node_modules/");
   });
 });
 

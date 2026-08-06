@@ -236,7 +236,13 @@ import {
   validatePageExports,
 } from "./plugins/strip-server-exports.js";
 import { removeConsoleCalls } from "./plugins/remove-console.js";
-import { createImportMetaUrlPlugin } from "./plugins/import-meta-url.js";
+import {
+  createBuildChunkCjsGlobalsPlugin,
+  createImportMetaUrlPlugin,
+  createOptimizeDepsCjsGlobalsPlugin,
+  createServeDependencyCjsGlobalsPlugin,
+  isBundledCommonJsDependencyId,
+} from "./plugins/import-meta-url.js";
 import { createRequireContextPlugin } from "./plugins/require-context.js";
 import { createExtensionlessDynamicImportPlugin } from "./plugins/extensionless-dynamic-import.js";
 import { createWasmModuleImportPlugin } from "./plugins/wasm-module-import.js";
@@ -618,9 +624,13 @@ function isScriptModuleId(id: string): boolean {
   return SCRIPT_IMPORT_RE.test(stripViteModuleQuery(id).toLowerCase());
 }
 
-function skipCommonjsForLocalCjs(id: string): false | undefined {
+function skipCommonjsForLocalCjs(
+  id: string,
+  transformBundledDependencies = false,
+): boolean | undefined {
   const cleanId = toSlash(stripViteModuleQuery(id));
-  return /\.c[jt]s$/i.test(cleanId) && !cleanId.includes("node_modules") ? false : undefined;
+  if (/\.c[jt]s$/i.test(cleanId) && !cleanId.includes("node_modules")) return false;
+  return transformBundledDependencies && isBundledCommonJsDependencyId(cleanId) ? true : undefined;
 }
 
 function hasOnlyTypeSpecifiers(statement: AstStaticDependencyDeclaration): boolean {
@@ -1839,10 +1849,16 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
     // rewritten output as CommonJS, failing with "Cannot use export statement
     // outside a module". Returning `false` makes vite-plugin-commonjs skip these
     // project-local files so rolldown's own CJS interop bundles them instead.
-    // For everything else we return `undefined` to preserve the plugin's
-    // defaults — including its existing skip of node_modules `.cjs` files.
+    // For dependencies that Node identifies as CommonJS, return true so the
+    // files actually loaded through a bundled SSR graph are converted on
+    // demand instead of requiring Vite's environment-wide dependency crawl.
     commonjs({
-      filter: skipCommonjsForLocalCjs,
+      filter(id: string) {
+        return skipCommonjsForLocalCjs(
+          id,
+          isServeCommand && !hasAppDir && !hasCloudflarePlugin && !hasNitroPlugin,
+        );
+      },
     }),
     {
       name: "vinext:global-not-found-css-isolation",
@@ -3083,6 +3099,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           },
         };
         const depOptimizeNodeEnvOptions = getDepOptimizeNodeEnvOptions(nodeEnvDefine);
+        const depOptimizeCjsGlobalsPlugin = createOptimizeDepsCjsGlobalsPlugin();
         // Apply the define to the default optimizer and explicitly to server
         // environments, where Vite's keepProcessEnv default prevents replacement.
         viteConfig.optimizeDeps = {
@@ -3381,8 +3398,17 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 // optimizer avoids the "new dependencies optimized" full
                 // reload the first time a Pages Router page renders an
                 // <Image>.
-                exclude: ["ipaddr.js"],
+                exclude: mergeOptimizeDepsExclude(
+                  incomingExclude,
+                  VINEXT_OPTIMIZE_DEPS_EXCLUDE,
+                  ["react", "react-dom", "react-dom/server", "ipaddr.js"],
+                  Object.keys(nextShimMap),
+                ),
                 ...depOptimizeNodeEnvOptions,
+                rolldownOptions: {
+                  ...depOptimizeNodeEnvOptions.rolldownOptions,
+                  plugins: [depOptimizeCjsGlobalsPlugin],
+                },
               },
               build: {
                 outDir: "dist/server",
@@ -6417,6 +6443,15 @@ export const loadServerActionClient = ${
         },
       },
     },
+    createServeDependencyCjsGlobalsPlugin({
+      // Pages SSR bundles configured dependencies through Vite's module
+      // runner. Preserve their Node source identity without enabling the
+      // environment-wide dependency crawler for every SSR tooling load.
+      enabled: () => isServeCommand && !hasAppDir && !hasCloudflarePlugin && !hasNitroPlugin,
+    }),
+    createBuildChunkCjsGlobalsPlugin({
+      enabled: () => !hasAppDir && !hasCloudflarePlugin && !hasNitroPlugin,
+    }),
     createImportMetaUrlPlugin({
       getRoot: () => root,
     }),
