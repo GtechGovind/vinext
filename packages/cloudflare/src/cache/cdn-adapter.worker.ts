@@ -48,9 +48,20 @@ type RestoredResponseStageRequest = {
   request: Request;
 };
 
-const RESPONSE_STAGE_EXPORT = "VinextCachedResponse";
+type CloudflareResponse = Response & {
+  readonly webSocket?: WebSocket | null;
+};
+
+type CloudflareResponseInit = ResponseInit & {
+  webSocket?: WebSocket | null;
+};
+
+const CACHED_RESPONSE_STAGE_EXPORT = "VinextCachedResponse";
+const UNCACHED_RESPONSE_STAGE_EXPORT = "VinextUncachedResponse";
 const AUTHORIZATION_TRANSPORT_HEADER = "x-vinext-internal-authorization";
+const REQUEST_CACHE_CONTROL_TRANSPORT_HEADER = "x-vinext-internal-request-cache-control";
 const REQUEST_CF_TRANSPORT_HEADER = "x-vinext-internal-request-cf";
+const REQUEST_PRAGMA_TRANSPORT_HEADER = "x-vinext-internal-request-pragma";
 const CLOUDFLARE_EDGE_POLICY_HEADER = "Cloudflare-CDN-Cache-Control";
 const SHARED_RESPONSE_STAGE_HEADER = "x-vinext-cloudflare-shared-response-stage";
 const RESPONSE_STAGE_WIRE_CACHE = {
@@ -90,11 +101,22 @@ function stampResponseStageBuildIdentity(response: Response): Response {
   } catch {
     const headers = new Headers(response.headers);
     headers.set(VINEXT_CDN_BUILD_ID_HEADER, buildIdentity);
-    return new Response(response.body, {
+    const webSocket = (response as CloudflareResponse).webSocket;
+    // A Workers WebSocket upgrade is the one non-standard status that can be
+    // reconstructed. Convert other non-HTTP responses before they cross the
+    // entrypoint boundary, where a network-error response would reject fetch.
+    if (!webSocket && (response.status < 200 || response.status > 599)) {
+      const unavailable = responseStageUnavailable();
+      unavailable.headers.set(VINEXT_CDN_BUILD_ID_HEADER, buildIdentity);
+      return unavailable;
+    }
+    const init: CloudflareResponseInit = {
       headers,
       status: response.status,
       statusText: response.statusText,
-    });
+    };
+    if (webSocket) init.webSocket = webSocket;
+    return new Response(response.body, init);
   }
 }
 
@@ -116,13 +138,17 @@ function validateResponseStageBuildIdentity(response: Response): Response {
 function stripUntrustedTransportHeaders(request: Request): Request {
   if (
     !request.headers.has(AUTHORIZATION_TRANSPORT_HEADER) &&
-    !request.headers.has(REQUEST_CF_TRANSPORT_HEADER)
+    !request.headers.has(REQUEST_CACHE_CONTROL_TRANSPORT_HEADER) &&
+    !request.headers.has(REQUEST_CF_TRANSPORT_HEADER) &&
+    !request.headers.has(REQUEST_PRAGMA_TRANSPORT_HEADER)
   ) {
     return request;
   }
   const headers = new Headers(request.headers);
   headers.delete(AUTHORIZATION_TRANSPORT_HEADER);
+  headers.delete(REQUEST_CACHE_CONTROL_TRANSPORT_HEADER);
   headers.delete(REQUEST_CF_TRANSPORT_HEADER);
+  headers.delete(REQUEST_PRAGMA_TRANSPORT_HEADER);
   const sanitized = new Request(request, { headers });
   const requestCf = Reflect.get(request, "cf");
   if (requestCf !== undefined) {
@@ -186,9 +212,10 @@ function hasPurge(value: unknown): value is Required<Pick<StageBinding, "purge">
 
 function getResponseStageBinding(
   context: CloudflareStageContext,
+  exportName: typeof CACHED_RESPONSE_STAGE_EXPORT | typeof UNCACHED_RESPONSE_STAGE_EXPORT,
   serializedInvocation: string,
 ): StageBinding | null {
-  const binding = context.exports?.[RESPONSE_STAGE_EXPORT];
+  const binding = context.exports?.[exportName];
   if (typeof binding !== "function") return null;
 
   // Configurable-entrypoint props cross a Workers RPC boundary. Some vinext
@@ -240,14 +267,26 @@ async function createCacheFacingRequest(
   const url = new URL(request.url);
   url.searchParams.set("__vinext_cache_key", key);
   const headers = new Headers(request.headers);
+  const requestCacheControl = headers.get("Cache-Control");
+  const requestPragma = headers.get("Pragma");
+  headers.delete("Cache-Control");
+  headers.delete("Pragma");
   headers.delete("Authorization");
   headers.delete(AUTHORIZATION_TRANSPORT_HEADER);
+  headers.delete(REQUEST_CACHE_CONTROL_TRANSPORT_HEADER);
   headers.delete(REQUEST_CF_TRANSPORT_HEADER);
+  headers.delete(REQUEST_PRAGMA_TRANSPORT_HEADER);
   if (authorization !== null) {
     headers.set(AUTHORIZATION_TRANSPORT_HEADER, encodeURIComponent(authorization));
   }
   if (serializedRequestCf !== null) {
     headers.set(REQUEST_CF_TRANSPORT_HEADER, serializedRequestCf);
+  }
+  if (requestCacheControl !== null) {
+    headers.set(REQUEST_CACHE_CONTROL_TRANSPORT_HEADER, encodeURIComponent(requestCacheControl));
+  }
+  if (requestPragma !== null) {
+    headers.set(REQUEST_PRAGMA_TRANSPORT_HEADER, encodeURIComponent(requestPragma));
   }
   const init = {
     // Explicitly replace inherited inbound `cf` metadata. In workerd,
@@ -259,7 +298,14 @@ async function createCacheFacingRequest(
   } satisfies RequestInit & {
     cf: { vary: { default: { action: "passthrough" } } };
   };
-  return new Request(new Request(url, request), init);
+  // Construct from the URL rather than cloning the inbound request. Workers
+  // carries cache-bypass state from browser reloads outside the visible header
+  // map, and cloning would leak that state into the cache-enabled entrypoint
+  // even after the directives above were transported privately.
+  return new Request(url, {
+    ...init,
+    method: request.method,
+  });
 }
 
 function restoreResponseStageRequest(
@@ -269,10 +315,16 @@ function restoreResponseStageRequest(
 ): RestoredResponseStageRequest {
   const headers = new Headers(request.headers);
   const serializedAuthorization = headers.get(AUTHORIZATION_TRANSPORT_HEADER);
+  const serializedRequestCacheControl = headers.get(REQUEST_CACHE_CONTROL_TRANSPORT_HEADER);
   const serializedRequestCf = headers.get(REQUEST_CF_TRANSPORT_HEADER);
+  const serializedRequestPragma = headers.get(REQUEST_PRAGMA_TRANSPORT_HEADER);
+  headers.delete("Cache-Control");
+  headers.delete("Pragma");
   headers.delete("Authorization");
   headers.delete(AUTHORIZATION_TRANSPORT_HEADER);
+  headers.delete(REQUEST_CACHE_CONTROL_TRANSPORT_HEADER);
   headers.delete(REQUEST_CF_TRANSPORT_HEADER);
+  headers.delete(REQUEST_PRAGMA_TRANSPORT_HEADER);
   if (serializedAuthorization !== null) {
     try {
       headers.set("Authorization", decodeURIComponent(serializedAuthorization));
@@ -284,6 +336,20 @@ function restoreResponseStageRequest(
   if (serializedRequestCf !== null) {
     try {
       requestCf = JSON.parse(decodeURIComponent(serializedRequestCf));
+    } catch {
+      // Malformed internal metadata is stripped rather than exposed to userland.
+    }
+  }
+  if (serializedRequestCacheControl !== null) {
+    try {
+      headers.set("Cache-Control", decodeURIComponent(serializedRequestCacheControl));
+    } catch {
+      // Malformed internal metadata is stripped rather than exposed to userland.
+    }
+  }
+  if (serializedRequestPragma !== null) {
+    try {
+      headers.set("Pragma", decodeURIComponent(serializedRequestPragma));
     } catch {
       // Malformed internal metadata is stripped rather than exposed to userland.
     }
@@ -399,7 +465,7 @@ function hasTaggedCustomVary(response: Response): boolean {
 }
 
 function withResponseStagePurge(context: CloudflareStageContext): CloudflareStageContext {
-  const factory = context.exports?.[RESPONSE_STAGE_EXPORT];
+  const factory = context.exports?.[CACHED_RESPONSE_STAGE_EXPORT];
   if (typeof factory !== "function") return context;
   const fallback = context.cache;
   return {
@@ -414,7 +480,10 @@ function withResponseStagePurge(context: CloudflareStageContext): CloudflareStag
   };
 }
 
-function getResponseStageInvocation(value: unknown): CloudflareResponseStageInvocation | null {
+function getResponseStageInvocation(
+  value: unknown,
+  expectedCache?: VinextResponseStageDispatchOptions["cache"],
+): CloudflareResponseStageInvocation | null {
   if (!value || typeof value !== "object") return null;
   const expectedResponseStageBuildIdentity = Reflect.get(
     value,
@@ -452,6 +521,7 @@ function getResponseStageInvocation(value: unknown): CloudflareResponseStageInvo
   } else {
     return null;
   }
+  if (expectedCache !== undefined && cache !== expectedCache) return null;
   const requestUrl = Reflect.get(value, "requestUrl");
   if (typeof requestUrl !== "string") return null;
   const requestMethod = Reflect.get(value, "requestMethod");
@@ -504,7 +574,7 @@ async function invokeResponseStage(
 export class VinextCachedResponse extends WorkerEntrypoint<unknown, unknown> {
   async fetch(request: Request): Promise<Response> {
     const context = withWorkerHostRuntime(this.ctx, this.env);
-    const invocation = getResponseStageInvocation(context.props);
+    const invocation = getResponseStageInvocation(context.props, "shared");
     if (!invocation) {
       return stampResponseStageBuildIdentity(
         new Response("Invalid vinext response-stage invocation", {
@@ -545,6 +615,31 @@ export class VinextCachedResponse extends WorkerEntrypoint<unknown, unknown> {
   }
 }
 
+/** Uncached response entrypoint. Bypass and probe renders execute only here. */
+export class VinextUncachedResponse extends WorkerEntrypoint<unknown, unknown> {
+  async fetch(request: Request): Promise<Response> {
+    const context = withResponseStagePurge(withWorkerHostRuntime(this.ctx, this.env));
+    const invocation = getResponseStageInvocation(context.props, "bypass");
+    if (!invocation) {
+      return stampResponseStageBuildIdentity(
+        new Response("Invalid vinext response-stage invocation", {
+          status: 400,
+          headers: { "Cache-Control": "no-store" },
+        }),
+      );
+    }
+    if (
+      invocation.expectedResponseStageBuildIdentity !== undefined &&
+      invocation.expectedResponseStageBuildIdentity !== getVinextCdnBuildIdentity()
+    ) {
+      return stampResponseStageBuildIdentity(responseStageUnavailable());
+    }
+    return stampResponseStageBuildIdentity(
+      await invokeResponseStage(request, this.env, context, invocation),
+    );
+  }
+}
+
 /** Uncached gateway: request routing and middleware always execute here. */
 export default {
   async fetch(
@@ -570,10 +665,7 @@ export default {
         requestMethod: stageRequest.method,
         requestUrl: stageRequest.url,
       };
-      const requiresEntrypoint = isResponseStageReadinessRequest(stageRequest);
-      if (options.cache === "bypass" && !requiresEntrypoint) {
-        return invokeResponseStage(stageRequest, env, stageContext, invocation);
-      }
+      const usesSharedCache = options.cache === "shared";
       try {
         const serializedInvocation = JSON.stringify({
           ...invocation,
@@ -585,24 +677,23 @@ export default {
                   cache: RESPONSE_STAGE_WIRE_CACHE[options.cache] satisfies ResponseStageWireCache,
                 },
         });
-        const binding = getResponseStageBinding(stageContext, serializedInvocation);
+        const binding = getResponseStageBinding(
+          stageContext,
+          usesSharedCache ? CACHED_RESPONSE_STAGE_EXPORT : UNCACHED_RESPONSE_STAGE_EXPORT,
+          serializedInvocation,
+        );
         if (!binding) {
-          return requiresEntrypoint
-            ? responseStageUnavailable()
-            : markSharedResponseStage(
-                await invokeResponseStage(stageRequest, env, stageContext, invocation),
-                sharedResponseStageProvenance,
-              );
+          return responseStageUnavailable();
         }
-        const entrypointRequest = requiresEntrypoint
-          ? stageRequest
-          : await createCacheFacingRequest(stageRequest, serializedInvocation);
+        const entrypointRequest = usesSharedCache
+          ? await createCacheFacingRequest(stageRequest, serializedInvocation)
+          : stageRequest;
         const response = validateResponseStageBuildIdentity(await binding.fetch(entrypointRequest));
-        return requiresEntrypoint
-          ? response
-          : markSharedResponseStage(response, sharedResponseStageProvenance, true);
+        return usesSharedCache
+          ? markSharedResponseStage(response, sharedResponseStageProvenance, true)
+          : response;
       } catch (error) {
-        if (requiresEntrypoint) return responseStageUnavailable();
+        if (isResponseStageReadinessRequest(stageRequest)) return responseStageUnavailable();
         throw error;
       }
     };

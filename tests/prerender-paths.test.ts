@@ -1062,6 +1062,100 @@ describe("prerender path manifest", () => {
     });
   });
 
+  it("does not expand staged middleware probes beyond its pathname matcher", async () => {
+    // Ported from Next.js: test/e2e/app-dir/middleware-matching/index.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/middleware-matching/index.test.ts
+    writeFile("package.json", JSON.stringify({ type: "module" }));
+    writeFile("dist/server/BUILD_ID", "build-a\n");
+    writeFile("dist/server/RSC_BUILD_ID", "rsc-build-a\n");
+    writeFile("dist/server/index.js", "export default {};\n");
+    writeFile(
+      "middleware.ts",
+      [
+        "export const config = { matcher: [",
+        '  "/middleware-source",',
+        '  { source: "/en/default-locale-source", locale: false },',
+        '  { source: "/fr/domain-locale-source", locale: false },',
+        "] };",
+        "export default function middleware() {}",
+      ].join("\n"),
+    );
+    for (const pathname of [
+      "middleware-source",
+      "default-locale-source",
+      "domain-locale-source",
+      "outside",
+    ]) {
+      writeFile(
+        `app/${pathname}/page.tsx`,
+        "export const revalidate = 60; export default function Page() {}\n",
+      );
+    }
+
+    const [{ emitPrerenderPathManifest }, { resolveNextConfig }] = await Promise.all([
+      import("../packages/vinext/src/build/prerender-paths.js"),
+      import("../packages/vinext/src/config/next-config.js"),
+    ]);
+    const manifest = await emitPrerenderPathManifest({
+      nextConfig: await resolveNextConfig(
+        {
+          i18n: {
+            defaultLocale: "en",
+            domains: [{ defaultLocale: "fr", domain: "fr.example.com" }],
+            locales: ["en", "fr"],
+          },
+        },
+        tmpDir,
+      ),
+      requestRouting: "uncached-stage",
+      responseVary: "verbatim",
+      root: tmpDir,
+    });
+
+    expect(manifest?.routePatterns?.["/middleware-source"]?.cacheabilityProbe).toMatchObject({
+      requestStageMayTerminate: true,
+      routeMayResolve: true,
+    });
+    for (const pathname of ["/default-locale-source", "/domain-locale-source"]) {
+      expect(manifest?.routePatterns?.[pathname]?.cacheabilityProbe).toMatchObject({
+        requestStageMayTerminate: true,
+        routeMayResolve: true,
+      });
+    }
+    expect(
+      manifest?.routePatterns?.["/outside"]?.cacheabilityProbe?.requestStageMayTerminate,
+    ).toBeUndefined();
+    expect(
+      manifest?.routePatterns?.["/outside"]?.cacheabilityProbe?.routeMayResolve,
+    ).toBeUndefined();
+  });
+
+  it("uses runtime pathname decoding and locale provenance for middleware probe scope", async () => {
+    const { matchesMiddlewareWarmPath } =
+      await import("../packages/vinext/src/build/prerender-paths.js");
+    const i18n = {
+      defaultLocale: "en",
+      domains: [{ defaultLocale: "fr", domain: "fr.example.com" }],
+      locales: ["en", "fr"],
+    };
+
+    expect(matchesMiddlewareWarmPath("/%64ecoded", "/decoded", null)).toBe(true);
+    expect(matchesMiddlewareWarmPath("/你好", "/%E4%BD%A0%E5%A5%BD", null)).toBe(true);
+    expect(
+      matchesMiddlewareWarmPath("/localized", [{ locale: false, source: "/en/localized" }], i18n),
+    ).toBe(true);
+    expect(
+      matchesMiddlewareWarmPath("/localized", [{ locale: false, source: "/fr/localized" }], i18n),
+    ).toBe(true);
+    expect(
+      matchesMiddlewareWarmPath(
+        "/fr/localized",
+        [{ locale: false, source: "/en/fr/localized" }],
+        i18n,
+      ),
+    ).toBe(false);
+  });
+
   it("retains redirect sources only when routing runs in an uncached stage", async () => {
     // Next.js applies config redirects before rendering the filesystem route:
     // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/navigation/navigation.test.ts

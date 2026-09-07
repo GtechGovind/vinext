@@ -313,6 +313,9 @@ export default createAdapter;
     const workerPath = path.join(root, "dist/server/index.js");
     const worker = fs.readFileSync(workerPath, "utf8");
     expect(worker).toMatch(/export\s*\{[^}]*\b(?:[A-Za-z_$][\w$]*\s+as\s+)?VinextCachedResponse\b/);
+    expect(worker).toMatch(
+      /export\s*\{[^}]*\b(?:[A-Za-z_$][\w$]*\s+as\s+)?VinextUncachedResponse\b/,
+    );
     expect(worker).not.toMatch(/import\s*["']\.\/__vinext_cacheability_manifest\.js["']/);
     expect(readTextFilesRecursive(path.join(root, "dist/server"))).toContain(RESPONSE_STAGE_MARKER);
     expect(readStaticJavaScriptClosure(workerPath)).not.toContain(RESPONSE_STAGE_MARKER);
@@ -338,6 +341,7 @@ export default createAdapter;
     expect(wrangler.exports).toMatchObject({
       default: { type: "worker", cache: { enabled: false } },
       VinextCachedResponse: { type: "worker", cache: { enabled: true } },
+      VinextUncachedResponse: { type: "worker", cache: { enabled: false } },
     });
     expect(wrangler.version_metadata).toEqual({ binding: "CF_VERSION_METADATA" });
     expect(wrangler.cache).toBeUndefined();
@@ -389,11 +393,15 @@ export default createAdapter;
     expect(fs.readFileSync(workerPath, "utf8")).toMatch(
       /export\s*\{[^}]*\b(?:[A-Za-z_$][\w$]*\s+as\s+)?VinextCachedResponse\b/,
     );
+    expect(fs.readFileSync(workerPath, "utf8")).toMatch(
+      /export\s*\{[^}]*\b(?:[A-Za-z_$][\w$]*\s+as\s+)?VinextUncachedResponse\b/,
+    );
     expect(readTextFilesRecursive(serverDir)).toContain(RESPONSE_STAGE_MARKER);
     expect(readStaticJavaScriptClosure(workerPath)).not.toContain(RESPONSE_STAGE_MARKER);
     expect(wrangler.exports).toMatchObject({
       default: { type: "worker", cache: { enabled: false } },
       VinextCachedResponse: { type: "worker", cache: { enabled: true } },
+      VinextUncachedResponse: { type: "worker", cache: { enabled: false } },
     });
     expect(wrangler.version_metadata).toEqual({ binding: "CF_VERSION_METADATA" });
     expect(wrangler.cache).toBeUndefined();
@@ -415,6 +423,7 @@ export default createAdapter;
       [
         'import handler from "vinext/server/fetch-handler";',
         'export class VinextCachedResponse { marker = "CUSTOM_RESERVED_EXPORT_MARKER"; }',
+        'export class VinextUncachedResponse { marker = "CUSTOM_UNCACHED_EXPORT_MARKER"; }',
         "export default handler;",
         "",
       ].join("\n"),
@@ -438,6 +447,7 @@ export default createAdapter;
     const buildOutput = readTextFilesRecursive(path.join(root, "dist/server"));
     expect(buildOutput).toContain("Invalid vinext response-stage invocation");
     expect(buildOutput).not.toContain("CUSTOM_RESERVED_EXPORT_MARKER");
+    expect(buildOutput).not.toContain("CUSTOM_UNCACHED_EXPORT_MARKER");
   }, 60_000);
 
   it("keeps the data adapter out of the emitted request-stage graph", async () => {
