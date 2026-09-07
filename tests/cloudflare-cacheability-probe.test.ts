@@ -66,17 +66,20 @@ describe("staged Worker cacheability probes", () => {
     };
   };
 
+  const staticProbeResponse = (pattern: string) =>
+    Response.json({
+      kind: "app-page",
+      pattern,
+      rendererStatic: true,
+      state: "static-candidate",
+      status: 200,
+      version: 1,
+    });
+
   const createStaticProbeFetch = () =>
     vi.fn<typeof fetch>(async (input) => {
       const pathname = new URL(input instanceof Request ? input.url : String(input)).pathname;
-      return Response.json({
-        kind: "app-page",
-        pattern: pathname,
-        rendererStatic: true,
-        state: "static-candidate",
-        status: 200,
-        version: 1,
-      });
+      return staticProbeResponse(pathname);
     });
 
   afterEach(() => {
@@ -199,14 +202,431 @@ describe("staged Worker cacheability probes", () => {
     expect(result.failures).toEqual(["/unavailable: probe returned HTTP 503"]);
   });
 
-  it("aborts when cacheability probing makes no progress", async () => {
+  it.each([408, 429, 502, 503, 504, 520])(
+    "retries transient probe HTTP status %i",
+    async (status) => {
+      const root = createProbeRoot();
+      const fetchImpl = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(new Response("unavailable", { status }))
+        .mockResolvedValueOnce(staticProbeResponse("/recovered"));
+
+      const result = await probeStagedWorkerCacheability({
+        buildId: "application-build",
+        fetchImpl,
+        retries: 1,
+        retryDelayMs: 0,
+        root,
+        targetUrl: "https://example.com",
+        targets: [target("/recovered")],
+      });
+
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+      expect(result.failures).toEqual([]);
+    },
+  );
+
+  it("does not retry an HTTP 500 probe response", async () => {
+    const root = createProbeRoot();
+    const fetchImpl = vi.fn<typeof fetch>(async () => new Response("broken", { status: 500 }));
+
+    const result = await probeStagedWorkerCacheability({
+      buildId: "application-build",
+      fetchImpl,
+      retries: 2,
+      retryDelayMs: 0,
+      root,
+      targetUrl: "https://example.com",
+      targets: [target("/broken")],
+    });
+
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(result.failures).toEqual(["/broken: probe returned HTTP 500"]);
+  });
+
+  it("retries a malformed successful probe envelope", async () => {
     const root = createProbeRoot();
     const fetchImpl = vi
       .fn<typeof fetch>()
-      .mockResolvedValueOnce(new Response("staged version unavailable", { status: 503 }))
-      .mockResolvedValueOnce(new Response("staged version unavailable", { status: 503 }))
-      // The no-progress watchdog remains authoritative even if fetch ignores abort.
-      .mockImplementation(() => new Promise<Response>(() => {}));
+      .mockResolvedValueOnce(new Response("{truncated", { status: 200 }))
+      .mockResolvedValueOnce(
+        Response.json({
+          kind: "app-page",
+          pattern: "/recovered",
+          rendererStatic: true,
+          state: "static-candidate",
+          status: 200,
+          version: 1,
+        }),
+      );
+
+    const result = await probeStagedWorkerCacheability({
+      buildId: "application-build",
+      fetchImpl,
+      retries: 1,
+      retryDelayMs: 0,
+      root,
+      targetUrl: "https://example.com",
+      targets: [target("/recovered")],
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(result.failures).toEqual([]);
+    expect(result).toMatchObject({ classified: 1, probed: 1 });
+  });
+
+  it("retries a transient Worker-side render classification failure", async () => {
+    const root = createProbeRoot();
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        Response.json({
+          kind: "app-page",
+          pattern: "/recovered",
+          reason: "response body did not complete before the probe deadline",
+          retryable: true,
+          state: "probe-failed",
+          status: 200,
+          version: 1,
+        }),
+      )
+      .mockResolvedValueOnce(staticProbeResponse("/recovered"));
+
+    const result = await probeStagedWorkerCacheability({
+      buildId: "application-build",
+      fetchImpl,
+      retries: 1,
+      retryDelayMs: 0,
+      root,
+      targetUrl: "https://example.com",
+      targets: [target("/recovered")],
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(result.failures).toEqual([]);
+    expect(result).toMatchObject({ classified: 1, probed: 1 });
+  });
+
+  it("requeues transient failures after the initial probe pass", async () => {
+    const root = createProbeRoot();
+    const attempts = new Map<string, number>();
+    const requestOrder: string[] = [];
+    const fetchImpl = vi.fn<typeof fetch>(async (input) => {
+      const pathname = new URL(input instanceof Request ? input.url : String(input)).pathname;
+      requestOrder.push(pathname);
+      const attempt = attempts.get(pathname) ?? 0;
+      attempts.set(pathname, attempt + 1);
+      if (pathname === "/slow" && attempt === 0) {
+        return Response.json({
+          kind: "app-page",
+          pattern: pathname,
+          reason: "response body did not complete before the probe deadline",
+          retryable: true,
+          state: "probe-failed",
+          status: 200,
+          version: 1,
+        });
+      }
+      return staticProbeResponse(pathname);
+    });
+
+    const result = await probeStagedWorkerCacheability({
+      buildId: "application-build",
+      concurrency: 1,
+      fetchImpl,
+      retries: 1,
+      retryDelayMs: 0,
+      root,
+      targetUrl: "https://example.com",
+      targets: [target("/slow"), target("/fast")],
+    });
+
+    expect(requestOrder).toEqual(["/slow", "/fast", "/slow"]);
+    expect(result.failures).toEqual([]);
+  });
+
+  it("requeues route-mover retries without occupying the only probe slot", async () => {
+    const root = createProbeRoot();
+    const moverRoute = {
+      cacheabilityProbe: { canPrunePattern: true, routeMayResolve: true },
+      kind: "app-page" as const,
+      pattern: "/move",
+    };
+    const mover = { ...target("/move"), route: moverRoute };
+    const ordinary = target("/ordinary");
+    const attempts = new Map<string, number>();
+    const requestOrder: string[] = [];
+    const result = await probeStagedWorkerCacheability({
+      buildId: "application-build",
+      concurrency: 1,
+      fetchImpl: async (input) => {
+        const pathname = new URL(input instanceof Request ? input.url : String(input)).pathname;
+        requestOrder.push(pathname);
+        const attempt = attempts.get(pathname) ?? 0;
+        attempts.set(pathname, attempt + 1);
+        if (pathname === "/move" && attempt === 0) {
+          return Response.json({
+            kind: "app-page",
+            pattern: moverRoute.pattern,
+            reason: "response body did not complete before the probe deadline",
+            retryable: true,
+            state: "probe-failed",
+            status: 200,
+            version: 1,
+          });
+        }
+        return staticProbeResponse(pathname);
+      },
+      retries: 1,
+      retryDelayMs: 0,
+      root,
+      targetUrl: "https://example.com",
+      targets: [mover, ordinary],
+    });
+
+    expect(requestOrder).toEqual(["/move", "/ordinary", "/move"]);
+    expect(result).toMatchObject({ failures: [], probed: 2 });
+  });
+
+  it("lets sibling pattern proof supersede a prunable representative retry", async () => {
+    const root = createProbeRoot();
+    const route = optimizableRoute("/posts/:slug");
+    const targets = ["one", "two", "three"].map((slug) => ({
+      ...target(`/posts/${slug}`),
+      route,
+    }));
+    const requestOrder: string[] = [];
+    const progress: Array<{ completed: number; skipped: number; total: number }> = [];
+    const result = await probeStagedWorkerCacheability({
+      buildId: "application-build",
+      concurrency: 1,
+      fetchImpl: async (input) => {
+        const pathname = new URL(input instanceof Request ? input.url : String(input)).pathname;
+        requestOrder.push(pathname);
+        if (requestOrder.length === 1) {
+          return Response.json({
+            kind: "app-page",
+            pattern: route.pattern,
+            reason: "response body did not complete before the probe deadline",
+            retryable: true,
+            state: "probe-failed",
+            status: 200,
+            version: 1,
+          });
+        }
+        return Response.json({
+          kind: "app-page",
+          pattern: route.pattern,
+          scope: "pattern",
+          state: "dynamic",
+          status: 200,
+          version: 1,
+        });
+      },
+      onProgress: ({ completed, skipped, total }) => {
+        progress.push({ completed, skipped, total });
+      },
+      retries: 1,
+      retryDelayMs: 0,
+      root,
+      targetUrl: "https://example.com",
+      targets,
+    });
+
+    expect(requestOrder).toEqual(["/posts/one", "/posts/two"]);
+    expect(result).toMatchObject({ failures: [], probed: 1 });
+    expect(progress.at(-1)).toEqual({ completed: 3, skipped: 2, total: 3 });
+  });
+
+  it("gives every concrete group its own retry budget", async () => {
+    const root = createProbeRoot();
+    const route = optimizableRoute("/posts/:slug");
+    const attempts = new Map<string, number>();
+    const requestOrder: string[] = [];
+    const result = await probeStagedWorkerCacheability({
+      buildId: "application-build",
+      concurrency: 1,
+      fetchImpl: async (input) => {
+        const pathname = new URL(input instanceof Request ? input.url : String(input)).pathname;
+        requestOrder.push(pathname);
+        const attempt = attempts.get(pathname) ?? 0;
+        attempts.set(pathname, attempt + 1);
+        if ((pathname === "/posts/one" || pathname === "/posts/two") && attempt === 0) {
+          return Response.json({
+            kind: "app-page",
+            pattern: route.pattern,
+            reason: "transient probe failure",
+            retryable: true,
+            state: "probe-failed",
+            status: 503,
+            version: 1,
+          });
+        }
+        return staticProbeResponse(route.pattern);
+      },
+      retries: 1,
+      retryDelayMs: 0,
+      root,
+      targetUrl: "https://example.com",
+      targets: ["one", "two", "three"].map((slug) => ({
+        ...target(`/posts/${slug}`),
+        route,
+      })),
+    });
+
+    expect(requestOrder).toEqual([
+      "/posts/one",
+      "/posts/two",
+      "/posts/three",
+      "/posts/one",
+      "/posts/two",
+    ]);
+    expect(result).toMatchObject({ failures: [], probed: 3 });
+  });
+
+  it("gives groups deferred by a route mover their own retry budget", async () => {
+    const root = createProbeRoot();
+    const destinationRoute = optimizableRoute("/posts/:slug");
+    const moverRoute = {
+      cacheabilityProbe: { canPrunePattern: true, routeMayResolve: true },
+      kind: "app-page" as const,
+      pattern: "/source",
+    };
+    const attempts = new Map<string, number>();
+    const requestOrder: string[] = [];
+    const result = await probeStagedWorkerCacheability({
+      buildId: "application-build",
+      concurrency: 1,
+      fetchImpl: async (input) => {
+        const pathname = new URL(input instanceof Request ? input.url : String(input)).pathname;
+        requestOrder.push(pathname);
+        const attempt = attempts.get(pathname) ?? 0;
+        attempts.set(pathname, attempt + 1);
+        if ((pathname === "/source" || pathname === "/posts/two") && attempt === 0) {
+          return Response.json({
+            kind: "app-page",
+            pattern: pathname === "/source" ? moverRoute.pattern : destinationRoute.pattern,
+            reason: "transient probe failure",
+            retryable: true,
+            state: "probe-failed",
+            status: 503,
+            version: 1,
+          });
+        }
+        if (pathname === "/source") {
+          return Response.json({
+            kind: "app-page",
+            pattern: destinationRoute.pattern,
+            rendererStatic: true,
+            routePathname: "/posts/source",
+            state: "static-candidate",
+            status: 200,
+            version: 1,
+          });
+        }
+        if (pathname === "/posts/one") {
+          return Response.json({
+            kind: "app-page",
+            pattern: destinationRoute.pattern,
+            scope: "pattern",
+            state: "dynamic",
+            status: 200,
+            version: 1,
+          });
+        }
+        return staticProbeResponse(destinationRoute.pattern);
+      },
+      retries: 1,
+      retryDelayMs: 0,
+      root,
+      targetUrl: "https://example.com",
+      targets: [
+        { ...target("/posts/one"), route: destinationRoute },
+        { ...target("/posts/two"), route: destinationRoute },
+        { ...target("/source"), route: moverRoute },
+      ],
+    });
+
+    expect(requestOrder).toEqual(["/source", "/posts/one", "/source", "/posts/two", "/posts/two"]);
+    expect(result).toMatchObject({ failures: [], probed: 3 });
+  });
+
+  it("honors configured probe concurrency above the former worker-pool cap", async () => {
+    const root = createProbeRoot();
+    const route = {
+      cacheabilityProbe: { canPrunePattern: true },
+      kind: "app-page" as const,
+      pattern: "/items/:slug",
+    };
+    const targets = Array.from({ length: 64 }, (_, index) => ({
+      ...target(`/items/${index}`),
+      route,
+    }));
+    let active = 0;
+    let maximumActive = 0;
+    let release!: () => void;
+    let reachedConfiguredConcurrency!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const allSlotsActive = new Promise<void>((resolve) => {
+      reachedConfiguredConcurrency = resolve;
+    });
+    const probing = probeStagedWorkerCacheability({
+      buildId: "application-build",
+      concurrency: 32,
+      fetchImpl: async () => {
+        active += 1;
+        maximumActive = Math.max(maximumActive, active);
+        if (active === 32) reachedConfiguredConcurrency();
+        await gate;
+        active -= 1;
+        return staticProbeResponse(route.pattern);
+      },
+      root,
+      targetUrl: "https://example.com",
+      targets,
+    });
+
+    await allSlotsActive;
+    expect(active).toBe(32);
+    release();
+    await expect(probing).resolves.toMatchObject({ failures: [], probed: 64 });
+    expect(maximumActive).toBe(32);
+  });
+
+  it("does not retry a deterministic Worker-side probe failure", async () => {
+    const root = createProbeRoot();
+    const fetchImpl = vi.fn<typeof fetch>(async () =>
+      Response.json({
+        kind: "app-page",
+        pattern: "/broken",
+        reason: "route returned HTTP 500",
+        state: "probe-failed",
+        status: 500,
+        version: 1,
+      }),
+    );
+
+    const result = await probeStagedWorkerCacheability({
+      buildId: "application-build",
+      fetchImpl,
+      retries: 2,
+      retryDelayMs: 0,
+      root,
+      targetUrl: "https://example.com",
+      targets: [target("/broken")],
+    });
+
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(result.failures).toEqual(["/broken: route returned HTTP 500"]);
+  });
+
+  it("aborts when cacheability probing makes no progress", async () => {
+    const root = createProbeRoot();
+    const fetchImpl = vi.fn<typeof fetch>(
+      async () => new Response("staged version unavailable", { status: 503 }),
+    );
 
     await expect(
       probeStagedWorkerCacheability({
@@ -218,11 +638,28 @@ describe("staged Worker cacheability probes", () => {
         retryDelayMs: 10,
         root,
         targetUrl: "https://example.com",
-        targets: [target("/one"), target("/two")],
+        targets: [target("/one")],
       }),
     ).rejects.toThrow("cacheability probing made no progress for 25ms");
-    expect(fetchImpl).toHaveBeenCalled();
     expect(fetchImpl.mock.calls.length).toBeLessThanOrEqual(3);
+  });
+
+  it("aborts a probe whose fetch never settles", async () => {
+    const root = createProbeRoot();
+    const fetchImpl = vi.fn<typeof fetch>(() => new Promise<Response>(() => {}));
+
+    await expect(
+      probeStagedWorkerCacheability({
+        buildId: "application-build",
+        fetchImpl,
+        phaseTimeoutMs: 25,
+        root,
+        targetUrl: "https://example.com",
+        targets: [target("/one")],
+        timeoutMs: 1_000,
+      }),
+    ).rejects.toThrow("cacheability probing made no progress for 25ms");
+    expect(fetchImpl).toHaveBeenCalledOnce();
   });
 
   it("allows a large serial workload to exceed the watchdog while requests keep completing", async () => {
@@ -478,7 +915,7 @@ describe("staged Worker cacheability probes", () => {
     );
   });
 
-  it("unlocks sibling paths without waiting for every pattern representative", async () => {
+  it("unlocks prunable siblings without waiting for every pattern representative", async () => {
     const root = createProbeRoot();
     const slow = target("/slow");
     const fastRoute = optimizableRoute("/fast/:slug");
@@ -512,6 +949,35 @@ describe("staged Worker cacheability probes", () => {
     });
 
     expect(result).toMatchObject({ failures: [], probed: 3 });
+    expect(siblingStartedBeforeSlowCompleted).toBe(true);
+  });
+
+  it("fills idle slots immediately for patterns with pattern-wide pruning", async () => {
+    const root = createProbeRoot();
+    const route = optimizableRoute("/items/:slug");
+    const slow = { ...target("/items/slow"), route };
+    const sibling = { ...target("/items/sibling"), route };
+    let slowCompleted = false;
+    let siblingStartedBeforeSlowCompleted = false;
+    const result = await probeStagedWorkerCacheability({
+      buildId: "application-build",
+      concurrency: 2,
+      fetchImpl: async (input) => {
+        const pathname = new URL(input instanceof Request ? input.url : String(input)).pathname;
+        if (pathname === "/items/slow") {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          slowCompleted = true;
+        } else {
+          siblingStartedBeforeSlowCompleted = !slowCompleted;
+        }
+        return staticProbeResponse(route.pattern);
+      },
+      root,
+      targetUrl: "https://example.com",
+      targets: [slow, sibling],
+    });
+
+    expect(result).toMatchObject({ failures: [], probed: 2 });
     expect(siblingStartedBeforeSlowCompleted).toBe(true);
   });
 
@@ -712,11 +1178,12 @@ describe("staged Worker cacheability probes", () => {
     expect(result.failures).toEqual(["1 warm target is missing route-pattern metadata"]);
   });
 
-  it("uses pattern-wide dynamic proof to skip sibling HTML and RSC renders", async () => {
+  it("uses the first completed pattern-wide dynamic proof to stop queued siblings", async () => {
     const root = createProbeRoot();
     const route = optimizableRoute("/posts/:slug");
     const htmlOne = { ...target("/posts/one"), route };
     const htmlTwo = { ...target("/posts/two"), route };
+    const htmlThree = { ...target("/posts/three"), route };
     const rsc = (slug: string) => ({
       headers: { Accept: "text/x-component", RSC: "1" },
       kind: "rsc-full" as const,
@@ -725,28 +1192,33 @@ describe("staged Worker cacheability probes", () => {
       route,
       sourcePathname: `/posts/${slug}`,
     });
-    const fetchImpl = vi.fn<typeof fetch>(async () =>
-      Response.json({
+    const fetchImpl = vi.fn<typeof fetch>(async (input) => {
+      const pathname = new URL(input instanceof Request ? input.url : String(input)).pathname;
+      if (pathname === "/posts/one") {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      return Response.json({
         kind: "app-page",
         pattern: route.pattern,
         scope: "pattern",
         state: "dynamic",
         status: 204,
         version: 1,
-      }),
-    );
+      });
+    });
 
     const result = await probeStagedWorkerCacheability({
       buildId: "application-build",
+      concurrency: 2,
       fetchImpl,
       retries: 0,
       root,
       targetUrl: "https://example.com",
-      targets: [rsc("one"), rsc("two"), htmlOne, htmlTwo],
+      targets: [rsc("one"), rsc("two"), rsc("three"), htmlOne, htmlTwo, htmlThree],
     });
 
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
-    expect(result).toMatchObject({ classified: 1, dynamic: 1, probed: 1, skipped: 1 });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ classified: 1, dynamic: 1, probed: 2, skipped: 1 });
     expect(result.cacheableTargets).toEqual([]);
     expect(result.manifest.routes).toEqual({});
   });
@@ -778,6 +1250,7 @@ describe("staged Worker cacheability probes", () => {
     const loadingTwo = loading("two");
     const result = await probeStagedWorkerCacheability({
       buildId: "application-build",
+      concurrency: 2,
       fetchImpl,
       retries: 0,
       root,
@@ -785,8 +1258,8 @@ describe("staged Worker cacheability probes", () => {
       targets: [loadingOne, loadingTwo, html("one"), html("two")],
     });
 
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
-    expect(result).toMatchObject({ classified: 1, dynamic: 1, probed: 1, skipped: 1 });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ classified: 1, dynamic: 1, probed: 2, skipped: 1 });
     expect(result.cacheableTargets).toEqual([loadingOne, loadingTwo]);
     expect(result.speculativeTargets).toEqual([loadingOne, loadingTwo]);
     expect(Object.values(result.manifest.routes)).toEqual([
